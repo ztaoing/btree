@@ -7,12 +7,20 @@
 package btre
 
 import (
+	"fmt"
+	"io"
+	"log"
 	"sort"
+	"strings"
 	"sync"
 )
 
 const (
 	DefaultFreelistSize = 32 //默认的freelist的大小
+)
+
+var (
+	nilChildren = make(children, 16)
 )
 
 type FreeList struct {
@@ -67,14 +75,6 @@ type ItemIterator func(i Item) bool
 
 func New(degree int) *BTree {
 	return NewWithFreelist(degree, NewFreeList(DefaultFreelistSize))
-}
-
-//BType是B-Tree的一个实现
-type BTree struct {
-	degree int //度
-	length int
-	root   *node
-	cow    *copyOnWriteContext
 }
 
 func NewWithFreelist(degree int, f *FreeList) *BTree {
@@ -142,17 +142,11 @@ func (i items) find(item Item) (index int, found bool) {
 	n := sort.Search(len(i), func(n int) bool {
 		return item.Less(i[n])
 	})
+	//已经存在
 	if n > 0 && !i[n-1].Less(item) {
 		return n - 1, true
 	}
 	return n, false
-}
-
-//树的节点
-type node struct {
-	items    items    //此节点的元素
-	children children //此节点包含的子节点
-	cow      *copyOnWriteContext
 }
 
 //children存储的是在一个node中的子node
@@ -168,11 +162,680 @@ func (c *children) insertAt(index int, n *node) {
 	(*c)[index] = n
 }
 
+//移除给定元素
 func (c *children) removeAt(index int) *node {
 	n := (*c)[index]
 	copy((*c)[index:], (*c)[index+1:])
+	//最后一位已经前移,所以需要设置为nil
 	(*c)[len(*c)-1] = nil
 	//更新
 	*c = (*c)[:len(*c)-1]
 	return n
+}
+
+//移除最后一个元素并返回
+func (c *children) pop() (out *node) {
+	index := len(*c) - 1
+	out = (*c)[index]
+	//将最后一个元素设置为nil
+	(*c)[index] = nil
+	//缩小切片的范围，切片是左闭右开
+	*c = (*c)[:index]
+	return out
+}
+
+//截断
+func (c *children) truncate(index int) {
+	var toClear children
+	//将(*c)[index:]从c中去掉
+	*c, toClear = (*c)[:index], (*c)[index:]
+	//将被截去的部分设置为nilChildren
+	for len(toClear) > 0 {
+		//copy的返回值是复制的长度
+		//nilChildren的长度为16，一次复制不完，会继续复制，直到toClear的长度为0
+		toClear = toClear[copy(toClear, nilChildren):]
+	}
+}
+
+//树的节点
+type node struct {
+	items    items    //此节点的元素
+	children children //此节点包含的子节点
+	cow      *copyOnWriteContext
+}
+
+//  copyOnWriteContext指针确定节点的所有权...具有与节点的写入上下文等效的写入上下文的树可用于修改该节点。
+//  不允许修改其写上下文与节点不匹配的树，并且必须创建一个新的可写副本（即，它是克隆）。 在执行任何写操作时，我们保持不变，即当前节点的上下文等于请求写入的树的上下文。
+//  为此，我们需要在上下文不匹配的情况下，通过使用正确的上下文创建一个副本，然后再进入任何节点。
+//  由于我们当前在任何写操作中访问的节点都具有请求树的上下文，因此该节点可以在适当的位置进行修改。 该节点的子节点可能不会共享上下文，但是在我们进入它们之前，我们将创建一个可变的副本。
+type copyOnWriteContext struct {
+	freelist *FreeList
+}
+
+//可变的
+func (n *node) mutableFor(cow *copyOnWriteContext) *node {
+	if n.cow == cow {
+		//返回当前节点
+		return n
+	}
+	out := cow.newNode()
+	if cap(out.items) >= len(n.items) {
+		//缩小
+		out.items = out.items[:len(n.items)]
+	} else {
+		//当cow的新节点的长度 < n的cow的长度的时候，创建的长度和容量为len(n.items)
+		out.items = make(items, len(n.items), cap(n.items))
+	}
+	copy(out.items, n.items)
+	//复制子节点
+	if cap(out.children) >= len(n.children) {
+		out.children = out.children[:len(n.children)]
+	} else {
+		out.children = make(children, len(n.children), cap(n.children))
+	}
+	copy(out.children, n.children)
+	return out
+}
+
+func (n *node) mutableChild(i int) *node {
+	c := n.children[i].mutableFor(n.cow)
+	n.children[i] = c
+	return c
+}
+
+func (n *node) split(i int) (Item, *node) {
+	item := n.items[i]
+	next := n.cow.newNode()
+	next.items = append(next.items, n.items[i+1:]...)
+	n.items.truncate(i)
+	if len(n.children) > 0 {
+		next.children = append(next.children, n.children[i+1:]...)
+		n.children.truncate(i + 1)
+	}
+	return item, next
+}
+
+//是否分裂child
+func (n *node) maybeSplitChild(i, maxItems int) bool {
+	//小于给定的maxItems
+	if len(n.children[i].items) < maxItems {
+		//不分裂
+		return false
+	}
+	//大于maxItems,则分裂
+	first := n.mutableChild(i)
+	item, second := first.split(maxItems / 2)
+	//在给定位置插入item
+	n.items.insertAt(i, item)
+	//插入的child中
+	n.children.insertAt(i+1, second)
+	return true
+}
+
+//在以此节点为根节点的子树上插入item，并且确保没有节点超出子树的maxItems
+//如果要插入的item已经存在，就把它返回
+func (n *node) insert(item Item, maxItems int) Item {
+	//i为item的位置
+	i, found := n.items.find(item)
+	if found {
+		out := n.items[i]
+		//更新
+		n.items[i] = item
+		return out
+	}
+	//不存在
+	//当前节点的子节点是空的
+	if len(n.children) == 0 {
+		//在给定的位置插入item
+		n.items.insertAt(i, item)
+	}
+	//拆分child
+	if n.maybeSplitChild(i, maxItems) {
+		inTree := n.items[i]
+		switch {
+		case item.Less(inTree):
+			//不做任何更改，我们只需要第一个拆分的node
+		case inTree.Less(item):
+			//我们需要的是第二个拆分的node
+			i++
+		default:
+			out := n.items[i]
+			n.items[i] = item
+			return out
+		}
+
+	}
+	return n.mutableChild(i).insert(item, maxItems)
+}
+
+//在子树中找到key
+func (n *node) get(key Item) Item {
+	i, found := n.items.find(key)
+	if found {
+		return n.items[i]
+	} else if len(n.children) > 0 {
+		//子节点不为空，去i的子树中查找
+		return n.children[i].get(key)
+	}
+	//没有找到
+	return nil
+}
+
+//返回子树中第一个item
+func min(n *node) Item {
+	if n == nil {
+		return nil
+	}
+	for len(n.children) > 0 {
+		//直到叶子节点为止，即children为空
+		//返回叶子节点的第一个
+		n = n.children[0]
+	}
+	//为空
+	if len(n.items) == 0 {
+		return nil
+	}
+	//返回叶子节点中第一个tem
+	return n.items[0]
+}
+
+//返回子树中最后一个item
+func max(n *node) Item {
+	if n == nil {
+		return nil
+	}
+	//到达叶子节点
+	for len(n.children) > 0 {
+		n = n.children[len(n.children)-1]
+	}
+	if len(n.items) == 0 {
+		return nil
+	}
+	return n.items[len(n.items)-1]
+}
+
+type toRemove int
+
+const (
+	removeItem toRemove = iota //移除给定的item
+	removeMin                  //移除子树中最小的item
+	removeMax                  //移除子树中最大的item
+)
+
+//移除node中的item
+func (n *node) remove(item Item, minItems int, typ toRemove) Item {
+	var i int
+	var found bool
+	switch typ {
+	case removeMax:
+		//移除子树中最大的item
+		if len(n.children) == 0 {
+			//子树为空，todo
+			return n.items.pop()
+		}
+		//high
+		i = len(n.items)
+	case removeMin:
+		//移除子树中最小的item
+		if len(n.children) == 0 {
+			return n.items.removeAt(0)
+		}
+		//low
+		i = 0
+	case removeItem:
+		i, found = n.items.find(item)
+		if len(n.children) == 0 {
+			if found {
+				return n.items.removeAt(i)
+			}
+			return nil
+		}
+	default:
+		panic("invalid type")
+	}
+
+	//以下children不为空
+	if len(n.children[i].items) <= minItems {
+		//小于给定的minItems,则扩大
+		return n.growChildAndRemove(i, item, minItems, typ)
+	}
+	child := n.mutableChild(i)
+	//要么我们有足够的items，或者做了一些merging/stealing,因为我们已经足够的items了，所以可以准备return stuff了
+	if found {
+		//item存在的位置是i，
+		//todo
+		// The item exists at index 'i', and the child we've selected can give us a
+		// predecessor, since if we've gotten here it's got > minItems items in it.
+		out := n.items[i]
+		// We use our special-case 'remove' call with typ=maxItem to pull the
+		// predecessor of item i (the rightmost leaf of our immediate left child)
+		// and set it into where we pulled the item from.
+		n.items[i] = child.remove(nil, minItems, removeMax)
+		return out
+	}
+	//一旦我们到了这个位置的时候，我们知道这个item不在node中，而且 the child 应该去移除因为已经足够大了
+	//递归调用
+	return child.remove(item, minItems, typ)
+
+}
+
+// growChildAndRemove增长子对象“ i”，以确保可以在将其保留在minItems的同时将其从item中删除，然后调用remove实际将其删除。
+//大多数文档说我们必须处理两种特殊情况：
+// 1）item在此节点中
+// 2）item在子项中
+//在两种情况下，我们都需要处理两个子情况：
+// A）节点具有足够的值，因此可以保留一个
+// B）节点的值不足
+//对于后者，我们必须检查：
+// a）左兄弟姐妹有剩余节点
+// b）兄弟姐妹有剩余节点
+// c）我们必须合并
+//为了简化代码，我们将情况＃1和＃2以相同的方式处理：
+//如果节点没有足够的item，则确保它有（使用a，b，c）。
+//然后，我们只是简单地重做移除调用，然后第二次（无论我们是在案例1还是案例2中），我们将有足够的项目并可以保证我们碰到案例A。
+func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) Item {
+	if i > 0 && len(n.children[i-1].items) > minItems {
+		//从左子节点窃取
+		child := n.mutableChild(i)
+		stealFrom := n.mutableChild(i - 1)
+		stolenItem := stealFrom.items.pop()
+		//在给定的位置插入
+		child.items.insertAt(0, n.items[i-1])
+		n.items[i-1] = stolenItem
+		if len(stealFrom.children) > 0 {
+			child.children.insertAt(0, stealFrom.children.pop())
+		}
+	} else if i < len(n.items) && len(n.children[i+1].items) > minItems {
+		// 从右子树窃取
+		child := n.mutableChild(i)
+		stealFrom := n.mutableChild(i + 1)
+		stolenItem := stealFrom.items.removeAt(0)
+		child.items = append(child.items, n.items[i])
+		n.items[i] = stolenItem
+		if len(stealFrom.children) > 0 {
+			child.children = append(child.children, stealFrom.children.removeAt(0))
+		}
+	} else {
+		if i >= len(n.items) {
+			i--
+		}
+		child := n.mutableChild(i)
+		// 和右子树合并
+		mergeItem := n.items.removeAt(i)
+		mergeChild := n.children.removeAt(i + 1)
+		child.items = append(child.items, mergeItem)
+		child.items = append(child.items, mergeChild.items...)
+		child.children = append(child.children, mergeChild.children...)
+		n.cow.freeNode(mergeChild)
+	}
+	return n.remove(item, minItems, typ)
+}
+
+type direction int //方向
+
+const (
+	descend = direction(-1) //下降
+	ascend  = direction(+1) //上升
+)
+
+//iterate提供了一个简单的可以遍历树中元素方法
+//当上升的时候，'start'应该比'stop'小，而且当下降的时候，'start'应该比'stop'大。
+//如果设置includeStart为true，当它等于start的时候，将会强制iterate去包括第一个item
+func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit bool, iter ItemIterator) (bool, bool) {
+	var ok, found bool
+	var index int
+	switch dir {
+	//上升
+	case ascend:
+		if start != nil {
+			index, _ = n.items.find(start)
+		}
+		for i := index; i < len(n.items); i++ {
+			if len(n.children) > 0 {
+				if hit, ok = n.children[i].iterate(dir, start, stop, includeStart, hit, iter); !ok {
+					return hit, false
+				}
+			}
+			if !includeStart && !hit && start != nil && !start.Less(n.items[i]) {
+				hit = true
+				continue
+			}
+			hit = true
+			if stop != nil && !n.items[i].Less(stop) {
+				return hit, false
+			}
+			if !iter(n.items[i]) {
+				return hit, false
+			}
+		}
+		if len(n.children) > 0 {
+			if hit, ok = n.children[len(n.children)-1].iterate(dir, start, stop, includeStart, hit, iter); !ok {
+				return hit, false
+			}
+		}
+		//下降
+	case descend:
+		if start != nil {
+			index, found = n.items.find(start)
+			if !found {
+				index = index - 1
+			}
+		} else {
+			index = len(n.items) - 1
+		}
+		for i := index; i >= 0; i-- {
+			if start != nil && !n.items[i].Less(start) {
+				if !includeStart || hit || start.Less(n.items[i]) {
+					continue
+				}
+			}
+			if len(n.children) > 0 {
+				if hit, ok = n.children[i+1].iterate(dir, start, stop, includeStart, hit, iter); !ok {
+					return hit, false
+				}
+			}
+			if stop != nil && !stop.Less(n.items[i]) {
+				return hit, false //	continue
+			}
+			hit = true
+			if !iter(n.items[i]) {
+				return hit, false
+			}
+		}
+		if len(n.children) > 0 {
+			if hit, ok = n.children[0].iterate(dir, start, stop, includeStart, hit, iter); !ok {
+				return hit, false
+			}
+		}
+	}
+	return hit, true
+}
+
+//用来test或debug
+func (n *node) print(w io.Writer, level int) {
+	fmt.Fprintf(w, "%sNODE:%v\n", strings.Repeat(" ", level), n.items)
+}
+
+//BType是B-Tree的一个实现
+type BTree struct {
+	degree int //度
+	length int
+	root   *node
+	cow    *copyOnWriteContext
+}
+
+//Clone是延迟clone btree。 不应该并发调用Clone，但是一旦Clone调用完成，就可以并发使用原始 tree (t) 和新tree (t2）。
+//b的内部树结构被标记为只读，并在t和t2之间共享。 对t和t2的写入均使用写时复制，只要b的原始节点之一被修改，就创建新节点。
+//读取操作不应降低性能。
+//由于上述写时复制逻辑，t和t2的写操作由于额外的分配和复制，引起的轻微变慢，但应该转化成原始树的原始性能特征。
+func (t *BTree) Clone() (t2 *BTree) {
+	//创幻了两个全新的写实复制的副本
+	// 这个操作，高效的创建了三个tree:
+	//   the original, 共享nodes (old b.cow)
+	//   the new b.cow nodes
+	//   the new out.cow nodes
+	cow1, cow2 := *t.cow, *t.cow
+	out := *t
+	t.cow = &cow1
+	out.cow = &cow2
+	return &out
+}
+
+// maxItems returns 每个node允许的最大items数
+func (t *BTree) maxItems() int {
+	return t.degree*2 - 1
+}
+
+// minItems returns 每个node允许的最小items数
+func (t *BTree) minItems() int {
+	return t.degree - 1
+}
+
+//创建一个新node
+func (c *copyOnWriteContext) newNode() (n *node) {
+	n = c.freelist.newNode()
+	n.cow = c
+	return
+}
+
+type freeType int
+
+const (
+	ftFreelistFull freeType = iota // node was freed (用来做垃圾回收, 不存储在freelist中)
+	ftStored                       // node 曾经存储在freelist中，并用来后续的使用
+	ftNotOwned                     // node 由于被另一个拥有，所以他会被COW忽略
+)
+
+// freeNode frees a node within a given COW context, if it's owned by that
+// context.  It returns what happened to the node (see freeType const
+// documentation).
+
+func (c *copyOnWriteContext) freeNode(n *node) freeType {
+	if n.cow == c {
+		// clear to allow GC
+		n.items.truncate(0)
+		n.children.truncate(0)
+		n.cow = nil
+		if c.freelist.freeNode(n) {
+			return ftStored
+		} else {
+			return ftFreelistFull
+		}
+	} else {
+		return ftNotOwned
+	}
+}
+
+// ReplaceOrInsert adds the given item to the tree.  If an item in the tree
+// already equals the given one, it is removed from the tree and returned.
+// Otherwise, nil is returned.
+//
+// nil cannot be added to the tree (will panic).
+func (t *BTree) ReplaceOrInsert(item Item) Item {
+	if item == nil {
+		panic("nil item being added to BTree")
+	}
+	if t.root == nil {
+		t.root = t.cow.newNode()
+		t.root.items = append(t.root.items, item)
+		t.length++
+		return nil
+	} else {
+		t.root = t.root.mutableFor(t.cow)
+		if len(t.root.items) >= t.maxItems() {
+			item2, second := t.root.split(t.maxItems() / 2)
+			oldroot := t.root
+			t.root = t.cow.newNode()
+			t.root.items = append(t.root.items, item2)
+			t.root.children = append(t.root.children, oldroot, second)
+		}
+	}
+	out := t.root.insert(item, t.maxItems())
+	if out == nil {
+		t.length++
+	}
+	return out
+}
+
+// Delete removes an item equal to the passed in item from the tree, returning
+// it.  If no such item exists, returns nil.
+func (t *BTree) Delete(item Item) Item {
+	return t.deleteItem(item, removeItem)
+}
+
+// DeleteMin removes the smallest item in the tree and returns it.
+// If no such item exists, returns nil.
+func (t *BTree) DeleteMin() Item {
+	return t.deleteItem(nil, removeMin)
+}
+
+// DeleteMax removes the largest item in the tree and returns it.
+// If no such item exists, returns nil.
+func (t *BTree) DeleteMax() Item {
+	return t.deleteItem(nil, removeMax)
+}
+
+func (t *BTree) deleteItem(item Item, typ toRemove) Item {
+	if t.root == nil || len(t.root.items) == 0 {
+		return nil
+	}
+	t.root = t.root.mutableFor(t.cow)
+	out := t.root.remove(item, t.minItems(), typ)
+	if len(t.root.items) == 0 && len(t.root.children) > 0 {
+		oldroot := t.root
+		t.root = t.root.children[0]
+		t.cow.freeNode(oldroot)
+	}
+	if out != nil {
+		t.length--
+	}
+	return out
+}
+
+// AscendRange calls the iterator for every value in the tree within the range
+// [greaterOrEqual, lessThan), until iterator returns false.
+func (t *BTree) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(ascend, greaterOrEqual, lessThan, true, false, iterator)
+}
+
+// AscendLessThan calls the iterator for every value in the tree within the range
+// [first, pivot), until iterator returns false.
+func (t *BTree) AscendLessThan(pivot Item, iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(ascend, nil, pivot, false, false, iterator)
+}
+
+// AscendGreaterOrEqual calls the iterator for every value in the tree within
+// the range [pivot, last], until iterator returns false.
+func (t *BTree) AscendGreaterOrEqual(pivot Item, iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(ascend, pivot, nil, true, false, iterator)
+}
+
+// Ascend calls the iterator for every value in the tree within the range
+// [first, last], until iterator returns false.
+func (t *BTree) Ascend(iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(ascend, nil, nil, false, false, iterator)
+}
+
+// DescendRange calls the iterator for every value in the tree within the range
+// [lessOrEqual, greaterThan), until iterator returns false.
+func (t *BTree) DescendRange(lessOrEqual, greaterThan Item, iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(descend, lessOrEqual, greaterThan, true, false, iterator)
+}
+
+// DescendLessOrEqual calls the iterator for every value in the tree within the range
+// [pivot, first], until iterator returns false.
+func (t *BTree) DescendLessOrEqual(pivot Item, iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(descend, pivot, nil, true, false, iterator)
+}
+
+// DescendGreaterThan calls the iterator for every value in the tree within
+// the range [last, pivot), until iterator returns false.
+func (t *BTree) DescendGreaterThan(pivot Item, iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(descend, nil, pivot, false, false, iterator)
+}
+
+// Descend calls the iterator for every value in the tree within the range
+// [last, first], until iterator returns false.
+func (t *BTree) Descend(iterator ItemIterator) {
+	if t.root == nil {
+		return
+	}
+	t.root.iterate(descend, nil, nil, false, false, iterator)
+}
+
+// Get looks for the key item in the tree, returning it.  It returns nil if
+// unable to find that item.
+func (t *BTree) Get(key Item) Item {
+	if t.root == nil {
+		return nil
+	}
+	return t.root.get(key)
+}
+
+// Min returns the smallest item in the tree, or nil if the tree is empty.
+func (t *BTree) Min() Item {
+	return min(t.root)
+}
+
+// Max returns the largest item in the tree, or nil if the tree is empty.
+func (t *BTree) Max() Item {
+	return max(t.root)
+}
+
+// Has returns true if the given key is in the tree.
+func (t *BTree) Has(key Item) bool {
+	return t.Get(key) != nil
+}
+
+// Len returns the number of items currently in the tree.
+func (t *BTree) Len() int {
+	return t.length
+}
+
+// Clear removes all items from the btree.  If addNodesToFreelist is true,
+// t's nodes are added to its freelist as part of this call, until the freelist
+// is full.  Otherwise, the root node is simply dereferenced and the subtree
+// left to Go's normal GC processes.
+//
+// This can be much faster
+// than calling Delete on all elements, because that requires finding/removing
+// each element in the tree and updating the tree accordingly.  It also is
+// somewhat faster than creating a new tree to replace the old one, because
+// nodes from the old tree are reclaimed into the freelist for use by the new
+// one, instead of being lost to the garbage collector.
+//
+// This call takes:
+//   O(1): when addNodesToFreelist is false, this is a single operation.
+//   O(1): when the freelist is already full, it breaks out immediately
+//   O(freelist size):  when the freelist is empty and the nodes are all owned
+//       by this tree, nodes are added to the freelist until full.
+//   O(tree size):  when all nodes are owned by another tree, all nodes are
+//       iterated over looking for nodes to add to the freelist, and due to
+//       ownership, none are.
+func (t *BTree) Clear(addNodesToFreelist bool) {
+	if t.root != nil && addNodesToFreelist {
+		t.root.reset(t.cow)
+	}
+	t.root, t.length = nil, 0
+}
+
+// reset returns a subtree to the freelist.  It breaks out immediately if the
+// freelist is full, since the only benefit of iterating is to fill that
+// freelist up.  Returns true if parent reset call should continue.
+func (n *node) reset(c *copyOnWriteContext) bool {
+	for _, child := range n.children {
+		if !child.reset(c) {
+			return false
+		}
+	}
+	return c.freeNode(n) != ftFreelistFull
+}
+
+// Int implements the Item interface for integers.
+type Int int
+
+// Less returns true if int(a) < int(b).
+func (a Int) Less(b Item) bool {
+	return a < b.(Int)
 }
