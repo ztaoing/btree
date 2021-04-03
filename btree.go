@@ -4,7 +4,7 @@
 * @Desc:
  */
 
-package btre
+package btree
 
 import (
 	"fmt"
@@ -67,10 +67,10 @@ type ItemIterator func(i Item) bool
 
 //根据给定degree来生成一个空闲链表
 func New(degree int) *BTree {
-	return NewWithFreelist(degree, NewFreeList(DefaultFreelistSize))
+	return NewWithFreeList(degree, NewFreeList(DefaultFreelistSize))
 }
 
-func NewWithFreelist(degree int, f *FreeList) *BTree {
+func NewWithFreeList(degree int, f *FreeList) *BTree {
 	if degree <= 1 {
 		panic("bad degree")
 	}
@@ -295,6 +295,7 @@ func (n *node) insert(item Item, maxItems int) Item {
 	if len(n.children) == 0 {
 		//在给定的位置插入item
 		n.items.insertAt(i, item)
+		return nil
 	}
 	//拆分child
 	if n.maybeSplitChild(i, maxItems) {
