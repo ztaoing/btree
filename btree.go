@@ -23,6 +23,9 @@ var (
 	nilChildren = make(children, 16)
 )
 
+/**
+freelist
+*/
 type FreeList struct {
 	mu       sync.Mutex //使用锁保证并发安全
 	freelist []*node    //空闲链表
@@ -33,6 +36,7 @@ func NewFreeList(size int) *FreeList {
 	return &FreeList{freelist: make([]*node, 0, size)}
 }
 
+//从空闲链表中取出一个node
 func (f *FreeList) newNode() (n *node) {
 	f.mu.Lock()
 	//当前freelist的长度
@@ -65,7 +69,7 @@ func (f *FreeList) freeNode(n *node) (out bool) {
 
 type ItemIterator func(i Item) bool
 
-//根据给定degree来生成一个空闲链表
+//根据给定degree来生成一个BTree
 func New(degree int) *BTree {
 	return NewWithFreeList(degree, NewFreeList(DefaultFreelistSize))
 }
@@ -76,10 +80,13 @@ func NewWithFreeList(degree int, f *FreeList) *BTree {
 	}
 	return &BTree{
 		degree: degree,
-		cow:    &copyOnWriteContext{freelist: f},
+		cow:    &copyOnWriteContext{freelist: f}, //copy on write，存储的是FreeList的指针
 	}
 }
 
+/**
+items
+*/
 type Item interface {
 	//当前的item是否小于给定的item
 	Less(than Item) bool
@@ -92,13 +99,14 @@ type items []Item
 func (i *items) insertAt(index int, item Item) {
 	//将nil添加到items中
 	*i = append(*i, nil)
-	//给定的index在items的范围内时,即已经存在
+	//给定的index在items的范围内时
 	if index < len(*i) {
 		//当前items的长度>index
-		//将(*i)[index:]复制到(*i)[index+1:]中
+		//将(*i)[index:]复制到(*i)[index+1:]中,即腾出位置，将数据后移
 		copy((*i)[index+1:], (*i)[index:])
 	}
-	//给定的index不再items的范围内时
+	//如果index大于len(*i)的长度，则直接设置值，小于len(*i)的长度需要腾出位置，将数据后移后再设置值
+	//将插入的数据加入到items中
 	(*i)[index] = item
 
 }
@@ -106,7 +114,7 @@ func (i *items) insertAt(index int, item Item) {
 //移除一个给定的index，并把所有子序列前移
 func (i *items) removeAt(index int) Item {
 	item := (*i)[index]
-
+	//数据迁移，覆盖index，并将最后一位去除
 	copy((*i)[index:], (*i)[index+1:])
 	//将最后一个元素设置为nil
 	(*i)[len(*i)-1] = nil
@@ -128,6 +136,7 @@ func (i *items) pop() (out Item) {
 //将index之后的元素清除
 func (i *items) truncate(index int) {
 	var toClear items
+	//toClear包括index
 	*i, toClear = (*i)[:index], (*i)[index:]
 	for len(toClear) > 0 {
 		toClear = toClear[copy(toClear, nilItems):]
@@ -136,6 +145,7 @@ func (i *items) truncate(index int) {
 
 //找到给定的item应该在这个list什么位置插入，如果item已经在list中存在，就返回索引index位置和true
 func (i items) find(item Item) (index int, found bool) {
+	//使用二分搜索找到item
 	n := sort.Search(len(i), func(n int) bool {
 		return item.Less(i[n])
 	})
@@ -146,6 +156,9 @@ func (i items) find(item Item) (index int, found bool) {
 	return n, false
 }
 
+/**
+children
+*/
 //children存储的是在一个node中的子node
 type children []*node
 
@@ -156,13 +169,14 @@ func (c *children) insertAt(index int, n *node) {
 	if index < len(*c) {
 		copy((*c)[index+1:], (*c)[index:])
 	}
-	//不存在
+	//设置值
 	(*c)[index] = n
 }
 
 //移除给定元素
 func (c *children) removeAt(index int) *node {
 	n := (*c)[index]
+	//前移覆盖掉index，并将最后一位移除
 	copy((*c)[index:], (*c)[index+1:])
 	//最后一位已经前移,所以需要设置为nil
 	(*c)[len(*c)-1] = nil
@@ -195,11 +209,14 @@ func (c *children) truncate(index int) {
 	}
 }
 
+/**
+node
+*/
 //树的节点
 type node struct {
-	items    items    //此节点的元素
-	children children //此节点包含的子节点
-	cow      *copyOnWriteContext
+	items    items               //此节点的元素
+	children children            //此节点包含的子节点的指针
+	cow      *copyOnWriteContext //copy on write
 }
 
 //  copyOnWriteContext指针确定节点的所有权...具有与节点的写入上下文等效的写入上下文的树可用于修改该节点。
@@ -217,7 +234,7 @@ func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 		//返回当前节点
 		return n
 	}
-	//生成copyOnWriteContext的一个新node
+	//从空闲链表中取出一个node
 	out := cow.newNode()
 	if cap(out.items) >= len(n.items) {
 		//缩小
@@ -226,18 +243,19 @@ func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 		//当cow的新节点的长度 < n的cow的长度的时候，创建的长度和容量为len(n.items)
 		out.items = make(items, len(n.items), cap(n.items))
 	}
+	//复制items
 	copy(out.items, n.items)
-	//复制子节点
 	if cap(out.children) >= len(n.children) {
 		out.children = out.children[:len(n.children)]
 	} else {
 		out.children = make(children, len(n.children), cap(n.children))
 	}
+	//复制children
 	copy(out.children, n.children)
 	return out
 }
 
-//todo 根据给定子节点-》可变
+// 根据给定子节点-》可变
 func (n *node) mutableChild(i int) *node {
 	c := n.children[i].mutableFor(n.cow)
 	n.children[i] = c
@@ -322,7 +340,7 @@ func (n *node) get(key Item) Item {
 	if found {
 		return n.items[i]
 	} else if len(n.children) > 0 {
-		//子节点不为空，去i的子树中查找
+		//在items中没有找到，去子树中查找
 		return n.children[i].get(key)
 	}
 	//没有找到
@@ -339,11 +357,11 @@ func min(n *node) Item {
 		//返回叶子节点的第一个
 		n = n.children[0]
 	}
-	//为空
+	//items为空
 	if len(n.items) == 0 {
 		return nil
 	}
-	//返回叶子节点中第一个tem
+	//返回叶子节点中第一个item
 	return n.items[0]
 }
 
@@ -352,7 +370,7 @@ func max(n *node) Item {
 	if n == nil {
 		return nil
 	}
-	//到达叶子节点
+	//现在子树中查找
 	for len(n.children) > 0 {
 		n = n.children[len(n.children)-1]
 	}
@@ -378,17 +396,17 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 	case removeMax:
 		//移除子树中最大的item
 		if len(n.children) == 0 {
-			//子树为空，todo
+			//子树为空，则取items中取一个
 			return n.items.pop()
 		}
-		//high
+		//最大索引
 		i = len(n.items)
 	case removeMin:
 		//移除子树中最小的item
 		if len(n.children) == 0 {
 			return n.items.removeAt(0)
 		}
-		//low
+		//最小索引值
 		i = 0
 	case removeItem:
 		i, found = n.items.find(item)
@@ -446,6 +464,7 @@ func (n *node) growChildAndRemove(i int, item Item, minItems int, typ toRemove) 
 		//从左子节点窃取
 		child := n.mutableChild(i)
 		stealFrom := n.mutableChild(i - 1)
+		//窃取的item
 		stolenItem := stealFrom.items.pop()
 		//在给定的位置插入
 		child.items.insertAt(0, n.items[i-1])
@@ -487,13 +506,13 @@ const (
 )
 
 //iterate提供了一个简单的可以遍历树中元素方法
-//当上升的时候，'start'应该比'stop'小，而且当下降的时候，'start'应该比'stop'大。
+//当升序迭代的时候，'start'应该比'stop'小，而且当降序迭代的时候，'start'应该比'stop'大。
 //如果设置includeStart为true，当它等于start的时候，将会强制iterate去包括第一个item
 func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit bool, iter ItemIterator) (bool, bool) {
 	var ok, found bool
 	var index int
 	switch dir {
-	//上升
+	//升序迭代
 	case ascend:
 		if start != nil {
 			index, _ = n.items.find(start)
@@ -521,7 +540,7 @@ func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit b
 				return hit, false
 			}
 		}
-		//下降
+		//降序迭代
 	case descend:
 		if start != nil {
 			index, found = n.items.find(start)
@@ -564,6 +583,9 @@ func (n *node) print(w io.Writer, level int) {
 	fmt.Fprintf(w, "%sNODE:%v\n", strings.Repeat(" ", level), n.items)
 }
 
+/**
+BTree
+*/
 //BType是B-Tree的一个实现
 type BTree struct {
 	degree int //度
@@ -601,6 +623,7 @@ func (t *BTree) minItems() int {
 
 //创建一个新node
 func (c *copyOnWriteContext) newNode() (n *node) {
+	//从空闲链表中取出一个node
 	n = c.freelist.newNode()
 	n.cow = c
 	return
@@ -639,12 +662,14 @@ func (t *BTree) ReplaceOrInsert(item Item) Item {
 	if item == nil {
 		panic("nil item being added to BTree")
 	}
+	//root节点为空
 	if t.root == nil {
 		t.root = t.cow.newNode()
 		t.root.items = append(t.root.items, item)
 		t.length++
 		return nil
 	} else {
+		//root节点不为空
 		t.root = t.root.mutableFor(t.cow)
 		if len(t.root.items) >= t.maxItems() {
 			item2, second := t.root.split(t.maxItems() / 2)
@@ -703,6 +728,7 @@ func (t *BTree) AscendRange(greaterOrEqual, lessThan Item, iterator ItemIterator
 }
 
 //AscendLessThan调用iterate方法，处理在tree中 [first, pivot)（注意左闭右开）范围内的每一个value，直到iterator返回false
+//返回小于pivot的结果，升序结果集
 func (t *BTree) AscendLessThan(pivot Item, iterator ItemIterator) {
 	if t.root == nil {
 		return
@@ -728,6 +754,7 @@ func (t *BTree) Ascend(iterator ItemIterator) {
 }
 
 // DescendRange 调用iterate方法，处理在tree中 [lessOrEqual, greaterThan)范围内的每一个value，直到iterator返回false
+// 输出范围内的降序结果集合
 func (t *BTree) DescendRange(lessOrEqual, greaterThan Item, iterator ItemIterator) {
 	if t.root == nil {
 		return
