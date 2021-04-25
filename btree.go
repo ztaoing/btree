@@ -118,7 +118,7 @@ func (i *items) removeAt(index int) Item {
 	copy((*i)[index:], (*i)[index+1:])
 	//将最后一个元素设置为nil
 	(*i)[len(*i)-1] = nil
-	//更新
+	//更新范围
 	*i = (*i)[:len(*i)-1]
 	return item
 }
@@ -157,7 +157,7 @@ func (i items) find(item Item) (index int, found bool) {
 }
 
 /**
-children
+children：对子node的操作
 */
 //children存储的是在一个node中的子node
 type children []*node
@@ -255,7 +255,7 @@ func (n *node) mutableFor(cow *copyOnWriteContext) *node {
 	return out
 }
 
-// 根据给定子节点-》可变
+// 窃取：根据给定子节点-》可变
 func (n *node) mutableChild(i int) *node {
 	c := n.children[i].mutableFor(n.cow)
 	n.children[i] = c
@@ -388,7 +388,7 @@ const (
 	removeMax                  //移除子树中最大的item
 )
 
-//移除node中的item
+//根据toRemove移除node中的item
 func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 	var i int
 	var found bool
@@ -409,6 +409,7 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 		//最小索引值
 		i = 0
 	case removeItem:
+		// 移除指定的item
 		i, found = n.items.find(item)
 		if len(n.children) == 0 {
 			if found {
@@ -420,7 +421,7 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 		panic("invalid type")
 	}
 
-	//以下children不为空
+	//以下children中的items数量小于minItems
 	if len(n.children[i].items) <= minItems {
 		//小于给定的minItems,则扩大
 		return n.growChildAndRemove(i, item, minItems, typ)
@@ -439,8 +440,8 @@ func (n *node) remove(item Item, minItems int, typ toRemove) Item {
 		n.items[i] = child.remove(nil, minItems, removeMax)
 		return out
 	}
-	//一旦我们到了这个位置的时候，我们知道这个item不在node中，而且 the child 应该去移除因为已经足够大了
-	//递归调用
+	// 一旦我们到了这个位置的时候，我们知道这个item不在node中，而且 the child 应该去移除因为已经足够大了
+	// 递归调用
 	return child.remove(item, minItems, typ)
 
 }
@@ -518,11 +519,13 @@ func (n *node) iterate(dir direction, start, stop Item, includeStart bool, hit b
 			index, _ = n.items.find(start)
 		}
 		for i := index; i < len(n.items); i++ {
+			// iterate one children
 			if len(n.children) > 0 {
 				if hit, ok = n.children[i].iterate(dir, start, stop, includeStart, hit, iter); !ok {
 					return hit, false
 				}
 			}
+			// i 不小于 i+1
 			if !includeStart && !hit && start != nil && !start.Less(n.items[i]) {
 				hit = true
 				continue
@@ -586,7 +589,7 @@ func (n *node) print(w io.Writer, level int) {
 /**
 BTree
 */
-//BType是B-Tree的一个实现
+//BTree是B-Tree的一个实现
 type BTree struct {
 	degree int //度
 	length int
@@ -594,12 +597,12 @@ type BTree struct {
 	cow    *copyOnWriteContext
 }
 
-//Clone是延迟clone btree。 不应该并发调用Clone，但是一旦Clone调用完成，就可以并发使用原始 tree (t) 和新tree (t2）。
+//Clone是延迟clone。 不应该并发调用Clone，但是一旦Clone调用完成，就可以并发使用原始 tree (t) 和新tree (t2）。
 //b的内部树结构被标记为只读，并在t和t2之间共享。 对t和t2的写入均使用写时复制，只要b的原始节点之一被修改，就创建新节点。
 //读取操作不应降低性能。
 //由于上述写时复制逻辑，t和t2的写操作由于额外的分配和复制，引起的轻微变慢，但应该转化成原始树的原始性能特征。
 func (t *BTree) Clone() (t2 *BTree) {
-	//创幻了两个全新的写实复制的副本
+	//创建了两个全新的写实复制的副本
 	// 这个操作，高效的创建了三个tree:
 	//   the original, 共享nodes (old b.cow)
 	//   the new b.cow nodes
